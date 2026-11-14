@@ -1,4 +1,4 @@
-name: Build Predictive Controller
+name: Build and Deploy Predictive Controller
 
 on:
   push:
@@ -8,10 +8,12 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/predictive-controller
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/predictive-scaling-controller
+  GITOPS_REPO: phuleshi/exam-platform-gitops
+  GITOPS_FILE: predictive-controller/deployment.yaml
 
 jobs:
-  build-and-push:
+  build-and-update-gitops:
     runs-on: ubuntu-latest
 
     permissions:
@@ -32,19 +34,46 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=sha,format=short
-
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Update image tag
+        run: |
+          cd gitops
+
+          sed -i \
+            "s|image: .*predictive-scaling-controller:.*|image: ${{ env.IMAGE_NAME }}:${{ github.sha }}|" \
+            "${{ env.GITOPS_FILE }}"
+
+          echo "Updated image:"
+          grep "image:" "${{ env.GITOPS_FILE }}"
+
+      - name: Commit and push GitOps changes
+        run: |
+          cd gitops
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ env.GITOPS_FILE }}"
+
+          if git diff --cached --quiet; then
+            echo "No GitOps changes."
+            exit 0
+          fi
+
+          git commit -m "Deploy predictive-controller ${{ github.sha }}"
+          git push origin HEAD:main
