@@ -11,10 +11,10 @@
         "pod_count"
     ],
     "target": "target_rps",
-    "forecast_horizon_seconds": 60,
+    "forecast_horizon_seconds": 10,
     "model_type": "RandomForestRegressor",
     "best_params": {
         "n_estimators": 300,
-        "max_depth": null
+        "max_depth": 12
     }
 }

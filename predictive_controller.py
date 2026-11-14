@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import json
 import pickle
 import logging
 from collections import deque
@@ -34,6 +35,10 @@ FEATURE_CONFIG_PATH = os.getenv(
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
 PROMETHEUS_TIMEOUT = int(os.getenv("PROMETHEUS_TIMEOUT", "10"))
+
+FORECAST_HORIZON_SECONDS = int(
+    os.getenv("FORECAST_HORIZON_SECONDS", "10")
+)
 
 # Scaling policy
 POD_CAPACITY = 120
@@ -119,29 +124,45 @@ logger = logging.getLogger("predictive-controller")
 # LOAD MODEL
 # ============================================================
 
-def load_artifacts():
-    if not os.path.isfile(MODEL_PATH):
-        raise FileNotFoundError(f"Không tìm thấy model: {MODEL_PATH}")
+# ============================================================
+# LOAD MODEL
+# ============================================================
 
+def load_artifacts():
+
+    # Kiểm tra model
+    if not os.path.isfile(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Không tìm thấy model: {MODEL_PATH}"
+        )
+
+    # Kiểm tra feature config
     if not os.path.isfile(FEATURE_CONFIG_PATH):
         raise FileNotFoundError(
             f"Không tìm thấy feature config: {FEATURE_CONFIG_PATH}"
         )
 
+    # Load model
     with open(MODEL_PATH, "rb") as f:
         model = pickle.load(f)
 
-    import json
-
+    # Load feature config
     with open(FEATURE_CONFIG_PATH, "r", encoding="utf-8") as f:
         config_data = json.load(f)
 
-    # Hỗ trợ cả JSON dạng list và dạng object có key features
-    if isinstance(config_data, list):
-        features = config_data
-    else:
-        features = config_data.get("features")
+    # Lấy danh sách features và forecast horizon
+    if not isinstance(config_data, dict):
+        raise ValueError(
+            "feature_config.json phải có định dạng JSON object."
+        )
 
+    features = config_data.get("features")
+
+    forecast_horizon = config_data.get(
+        "forecast_horizon_seconds"
+    )
+
+    # Kiểm tra features
     if not isinstance(features, list):
         raise ValueError(
             "feature_config.json phải chứa danh sách features."
@@ -154,8 +175,41 @@ def load_artifacts():
             f"Loaded: {features}"
         )
 
+    # Kiểm tra forecast horizon
+    if forecast_horizon is None:
+        raise ValueError(
+            "feature_config.json thiếu forecast_horizon_seconds."
+        )
+
+    try:
+        forecast_horizon = int(forecast_horizon)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "forecast_horizon_seconds phải là số nguyên."
+        )
+
+    if forecast_horizon <= 0:
+        raise ValueError(
+            f"Forecast horizon không hợp lệ: {forecast_horizon}"
+        )
+
+    if forecast_horizon != FORECAST_HORIZON_SECONDS:
+        raise ValueError(
+            "Forecast horizon không khớp cấu hình controller.\n"
+            f"Expected: {FORECAST_HORIZON_SECONDS}s\n"
+            f"Loaded: {forecast_horizon}s"
+        )
+
+    # Log thông tin
     logger.info("Loaded model: %s", MODEL_PATH)
-    logger.info("Loaded %d model features.", len(features))
+    logger.info(
+        "Loaded %d model features.",
+        len(features)
+    )
+    logger.info(
+        "Forecast horizon: %ss",
+        forecast_horizon
+    )
 
     return model, features
 
@@ -388,6 +442,7 @@ def run_controller():
     logger.info("==============================================")
     logger.info("Prometheus URL : %s", PROMETHEUS_URL)
     logger.info("Poll interval  : %ss", POLL_INTERVAL)
+    logger.info("Forecast horizon: %ss", FORECAST_HORIZON_SECONDS)
     logger.info("Namespace      : %s", K8S_NAMESPACE)
     logger.info("Deployment     : %s", K8S_DEPLOYMENT)
     logger.info(
