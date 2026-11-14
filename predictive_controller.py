@@ -1,3 +1,4 @@
+
 import os
 import time
 import math
@@ -5,7 +6,7 @@ import json
 import pickle
 import logging
 from collections import deque
-from datetime import datetime, timezone
+
 from kubernetes import client, config
 from kubernetes.client.exceptions import ApiException
 
@@ -50,9 +51,6 @@ MAX_REPLICAS = 6
 K8S_NAMESPACE = os.getenv("K8S_NAMESPACE", "exam-platform")
 K8S_DEPLOYMENT = os.getenv("K8S_DEPLOYMENT", "backend")
 
-SCALE_DOWN_CONFIRMATIONS = 3
-SCALE_DOWN_COOLDOWN = 60
-
 apps_api = None
 
 EXPECTED_FEATURES = [
@@ -67,7 +65,7 @@ EXPECTED_FEATURES = [
     "pod_count",
 ]
 
-# Keep these queries identical to the metric collector used for training.
+# Prometheus queries
 PROMQL = {
     "rps": """
         sum(
@@ -79,6 +77,7 @@ PROMQL = {
             )
         )
     """,
+
     "cpu": """
         sum(
             rate(
@@ -89,6 +88,7 @@ PROMQL = {
             )
         )
     """,
+
     "memory": """
         sum(
             container_memory_working_set_bytes{
@@ -97,6 +97,7 @@ PROMQL = {
             }
         )
     """,
+
     "pod_count": """
         count(
             kube_pod_status_phase{
@@ -117,6 +118,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+
 logger = logging.getLogger("predictive-controller")
 
 
@@ -124,19 +126,13 @@ logger = logging.getLogger("predictive-controller")
 # LOAD MODEL
 # ============================================================
 
-# ============================================================
-# LOAD MODEL
-# ============================================================
-
 def load_artifacts():
 
-    # Kiểm tra model
     if not os.path.isfile(MODEL_PATH):
         raise FileNotFoundError(
             f"Không tìm thấy model: {MODEL_PATH}"
         )
 
-    # Kiểm tra feature config
     if not os.path.isfile(FEATURE_CONFIG_PATH):
         raise FileNotFoundError(
             f"Không tìm thấy feature config: {FEATURE_CONFIG_PATH}"
@@ -150,7 +146,6 @@ def load_artifacts():
     with open(FEATURE_CONFIG_PATH, "r", encoding="utf-8") as f:
         config_data = json.load(f)
 
-    # Lấy danh sách features và forecast horizon
     if not isinstance(config_data, dict):
         raise ValueError(
             "feature_config.json phải có định dạng JSON object."
@@ -162,7 +157,7 @@ def load_artifacts():
         "forecast_horizon_seconds"
     )
 
-    # Kiểm tra features
+    # Validate features
     if not isinstance(features, list):
         raise ValueError(
             "feature_config.json phải chứa danh sách features."
@@ -175,7 +170,7 @@ def load_artifacts():
             f"Loaded: {features}"
         )
 
-    # Kiểm tra forecast horizon
+    # Validate forecast horizon
     if forecast_horizon is None:
         raise ValueError(
             "feature_config.json thiếu forecast_horizon_seconds."
@@ -200,16 +195,9 @@ def load_artifacts():
             f"Loaded: {forecast_horizon}s"
         )
 
-    # Log thông tin
     logger.info("Loaded model: %s", MODEL_PATH)
-    logger.info(
-        "Loaded %d model features.",
-        len(features)
-    )
-    logger.info(
-        "Forecast horizon: %ss",
-        forecast_horizon
-    )
+    logger.info("Loaded %d model features.", len(features))
+    logger.info("Forecast horizon: %ss", forecast_horizon)
 
     return model, features
 
@@ -219,42 +207,53 @@ def load_artifacts():
 # ============================================================
 
 def query_prometheus(query, retries=3, retry_delay=2):
+
     url = f"{PROMETHEUS_URL}/api/v1/query"
 
     for attempt in range(1, retries + 1):
+
         try:
             response = requests.get(
                 url,
                 params={"query": query},
                 timeout=PROMETHEUS_TIMEOUT,
             )
+
             response.raise_for_status()
 
             payload = response.json()
+
             if payload.get("status") != "success":
-                raise RuntimeError(f"Prometheus query failed: {payload}")
+                raise RuntimeError(
+                    f"Prometheus query failed: {payload}"
+                )
 
             results = payload.get("data", {}).get("result", [])
+
             if not results:
                 return None
 
             value = results[0]["value"][1]
+
             if value in ("NaN", "Inf", "+Inf", "-Inf"):
                 return None
 
             number = float(value)
+
             if not math.isfinite(number):
                 return None
 
             return number
 
         except Exception as exc:
+
             logger.warning(
                 "Prometheus request failed (%d/%d): %s",
                 attempt,
                 retries,
                 exc,
             )
+
             if attempt < retries:
                 time.sleep(retry_delay)
 
@@ -262,15 +261,22 @@ def query_prometheus(query, retries=3, retry_delay=2):
 
 
 def collect_live_metrics():
+
     metrics = {}
 
     for name, query in PROMQL.items():
         metrics[name] = query_prometheus(query)
 
-    missing = [name for name, value in metrics.items() if value is None]
+    missing = [
+        name
+        for name, value in metrics.items()
+        if value is None
+    ]
+
     if missing:
         raise RuntimeError(
-            "Thiếu metrics bắt buộc từ Prometheus: " + ", ".join(missing)
+            "Thiếu metrics bắt buộc từ Prometheus: "
+            + ", ".join(missing)
         )
 
     metrics["pod_count"] = int(metrics["pod_count"])
@@ -287,7 +293,7 @@ def collect_live_metrics():
 
 def build_feature_row(metrics, rps_history, feature_names):
     """
-    rps_history chứa tối đa 5 mẫu RPS trước mẫu hiện tại.
+    rps_history chứa tối đa 5 mẫu RPS trước đó.
     Thứ tự: cũ -> mới.
     """
 
@@ -324,11 +330,13 @@ def build_feature_row(metrics, rps_history, feature_names):
         columns=feature_names,
     )
 
+
 # ============================================================
 # REPLICA CALCULATION
 # ============================================================
 
 def calculate_scaling_decision(predicted_rps):
+
     predicted_rps = float(predicted_rps)
 
     if not math.isfinite(predicted_rps) or predicted_rps < 0:
@@ -336,15 +344,15 @@ def calculate_scaling_decision(predicted_rps):
             f"Predicted RPS không hợp lệ: {predicted_rps}"
         )
 
-    # Bù sai số dự đoán bằng safety factor
+    # Apply safety factor
     safe_rps = predicted_rps * SAFETY_FACTOR
 
-    # Tính số replica cần thiết
+    # Calculate required replicas
     required_replicas = math.ceil(
         safe_rps / POD_CAPACITY
     )
 
-    # Giới hạn min/max replicas
+    # Apply min/max limits
     target_replicas = max(
         MIN_REPLICAS,
         min(MAX_REPLICAS, required_replicas),
@@ -359,6 +367,7 @@ def calculate_scaling_decision(predicted_rps):
         "capacity_limited": required_replicas > MAX_REPLICAS,
     }
 
+
 # ============================================================
 # KUBERNETES API
 # ============================================================
@@ -366,7 +375,7 @@ def calculate_scaling_decision(predicted_rps):
 def initialize_kubernetes():
     global apps_api
 
-    # Controller chạy bên trong Kubernetes.
+    # Controller chạy bên trong Kubernetes
     config.load_incluster_config()
 
     apps_api = client.AppsV1Api()
@@ -385,6 +394,7 @@ def initialize_kubernetes():
 
 
 def get_current_replicas():
+
     deployment = apps_api.read_namespaced_deployment(
         name=K8S_DEPLOYMENT,
         namespace=K8S_NAMESPACE,
@@ -397,6 +407,7 @@ def get_current_replicas():
 
 
 def scale_deployment(target_replicas):
+
     target_replicas = max(
         MIN_REPLICAS,
         min(MAX_REPLICAS, int(target_replicas)),
@@ -420,31 +431,30 @@ def scale_deployment(target_replicas):
         target_replicas,
     )
 
+
 # ============================================================
 # CONTROLLER LOOP
 # ============================================================
 
 def run_controller():
-    global apps_api
 
     model, feature_names = load_artifacts()
 
-    # Kết nối Kubernetes
+    # Connect to Kubernetes
     initialize_kubernetes()
 
     rps_history = deque(maxlen=5)
 
-    consecutive_scale_down = 0
-    last_scale_time = 0.0
-
     logger.info("==============================================")
     logger.info("       Predictive Auto Scaling Controller")
     logger.info("==============================================")
+
     logger.info("Prometheus URL : %s", PROMETHEUS_URL)
     logger.info("Poll interval  : %ss", POLL_INTERVAL)
     logger.info("Forecast horizon: %ss", FORECAST_HORIZON_SECONDS)
     logger.info("Namespace      : %s", K8S_NAMESPACE)
     logger.info("Deployment     : %s", K8S_DEPLOYMENT)
+
     logger.info(
         "Policy         : capacity=%s, safety=%s, replicas=%s-%s",
         POD_CAPACITY,
@@ -452,18 +462,24 @@ def run_controller():
         MIN_REPLICAS,
         MAX_REPLICAS,
     )
-    logger.info("Scale-down confirmation: %s cycles", SCALE_DOWN_CONFIRMATIONS)
-    logger.info("Scale-down cooldown: %ss", SCALE_DOWN_COOLDOWN)
-    logger.info("Mode           : ACTIVE KUBERNETES SCALING")
+
+    logger.info("Scale-down     : DISABLED")
+    logger.info("Mode           : SCALE-UP ONLY")
 
     while True:
+
         loop_start = time.monotonic()
 
         try:
+
+            # Collect metrics
             metrics = collect_live_metrics()
+
             current_rps = float(metrics["rps"])
 
+            # Warm-up phase
             if len(rps_history) < 5:
+
                 rps_history.append(current_rps)
 
                 logger.info(
@@ -473,95 +489,114 @@ def run_controller():
                 )
 
             else:
+
+                # Build model features
                 feature_row = build_feature_row(
                     metrics,
                     rps_history,
                     feature_names,
                 )
 
+                # Predict future RPS
                 prediction = model.predict(feature_row)
+
                 predicted_rps = float(prediction[0])
 
-                decision = calculate_scaling_decision(predicted_rps)
+                # Calculate scaling decision
+                decision = calculate_scaling_decision(
+                    predicted_rps
+                )
 
-                # Đọc replica thực tế từ Kubernetes, không dùng pod_count
-                # của Prometheus để quyết định replica hiện tại.
+                # Read actual replicas from Kubernetes
                 current_replicas, ready_replicas = get_current_replicas()
 
                 target_replicas = decision["target_replicas"]
+
                 action = "NO CHANGE"
 
                 # ==========================================
-                # SCALE UP: thực hiện ngay
+                # SCALE UP: execute immediately
                 # ==========================================
 
                 if target_replicas > current_replicas:
-                    consecutive_scale_down = 0
 
                     scale_deployment(target_replicas)
-                    last_scale_time = time.monotonic()
 
-                    action = f"SCALE UP: {current_replicas} -> {target_replicas}"
+                    action = (
+                        f"SCALE UP: "
+                        f"{current_replicas} -> {target_replicas}"
+                    )
 
                 # ==========================================
-                # SCALE DOWN: cần xác nhận và cooldown
+                # SCALE DOWN: COMPLETELY DISABLED
                 # ==========================================
 
                 elif target_replicas < current_replicas:
+
                     logger.info(
                         "SCALE DOWN DISABLED: Current=%d, Target=%d",
                         current_replicas,
                         target_replicas,
                     )
 
-                    # Không cho phép giảm số lượng Pod
-                    consecutive_scale_down = 0
+                    # Keep current replicas
                     target_replicas = current_replicas
 
-                    # Cập nhật lại decision để log đúng số replica thực tế
-                    decision["target_replicas"] = target_replicas
-                    decision["capacity_at_target"] = target_replicas * POD_CAPACITY
+                    decision["target_replicas"] = current_replicas
 
-                    action = "SCALE DOWN DISABLED - KEEP CURRENT REPLICAS"
-                    else:
-                        action = (
-                            f"WAIT SCALE DOWN "
-                            f"({consecutive_scale_down}/"
-                            f"{SCALE_DOWN_CONFIRMATIONS}), "
-                            f"cooldown={max(0, SCALE_DOWN_COOLDOWN - elapsed_since_scale):.0f}s"
-                        )
+                    decision["capacity_at_target"] = (
+                        current_replicas * POD_CAPACITY
+                    )
+
+                    action = (
+                        "SCALE DOWN DISABLED - "
+                        "KEEP CURRENT REPLICAS"
+                    )
+
+                # ==========================================
+                # NO CHANGE
+                # ==========================================
 
                 else:
-                    consecutive_scale_down = 0
 
+                    action = "NO CHANGE"
+
+                # Log scaling decision
                 logger.info(
                     "RPS=%.2f | Predicted=%.2f | Safe RPS=%.2f | "
                     "Required=%d | Target=%d | Capacity=%d | "
                     "Current=%d | Ready=%d | %s",
+
                     current_rps,
                     decision["predicted_rps"],
                     decision["safe_rps"],
                     decision["required_replicas"],
-                    decision["target_replicas"],
+                    target_replicas,
                     decision["capacity_at_target"],
                     current_replicas,
                     ready_replicas,
                     action,
                 )
 
+                # Warn when maximum capacity is insufficient
                 if decision["capacity_limited"]:
+
                     logger.warning(
-                        "MAX REPLICAS REACHED: Safe RPS=%.2f exceeds max capacity=%d RPS",
+                        "MAX REPLICAS REACHED: Safe RPS=%.2f "
+                        "exceeds max capacity=%d RPS",
+
                         decision["safe_rps"],
                         MAX_REPLICAS * POD_CAPACITY,
                     )
 
+                # Update RPS history
                 rps_history.append(current_rps)
 
         except KeyboardInterrupt:
             raise
 
         except ApiException as exc:
+
             logger.exception(
                 "Kubernetes API error: status=%s, reason=%s",
                 exc.status,
@@ -569,15 +604,29 @@ def run_controller():
             )
 
         except Exception as exc:
-            logger.exception("Controller iteration failed: %s", exc)
 
+            logger.exception(
+                "Controller iteration failed: %s",
+                exc,
+            )
+
+        # Maintain polling interval
         elapsed = time.monotonic() - loop_start
-        time.sleep(max(0, POLL_INTERVAL - elapsed))
 
+        time.sleep(
+            max(0, POLL_INTERVAL - elapsed)
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
+
     try:
         run_controller()
+
     except KeyboardInterrupt:
         logger.info("Controller stopped by user.")
 
