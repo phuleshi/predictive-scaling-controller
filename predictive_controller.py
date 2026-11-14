@@ -22,14 +22,21 @@ PROMETHEUS_URL = os.getenv(
     "http://127.0.0.1:9090"
 ).rstrip("/")
 
-MODEL_PATH = os.getenv("MODEL_PATH", "rps_prediction_model_v2.pkl")
-FEATURE_CONFIG_PATH = os.getenv("FEATURE_CONFIG_PATH", "feature_config_v2.pkl")
+MODEL_PATH = os.getenv(
+    "MODEL_PATH",
+    "rps_prediction_model.pkl"
+)
+
+FEATURE_CONFIG_PATH = os.getenv(
+    "FEATURE_CONFIG_PATH",
+    "feature_config.json"
+)
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
 PROMETHEUS_TIMEOUT = int(os.getenv("PROMETHEUS_TIMEOUT", "10"))
 
 # Scaling policy
-POD_CAPACITY = 100
+POD_CAPACITY = 120
 SAFETY_FACTOR = 1.2
 MIN_REPLICAS = 2
 MAX_REPLICAS = 6
@@ -43,19 +50,16 @@ SCALE_DOWN_COOLDOWN = 60
 
 apps_api = None
 
-# Model V2 feature order (must match training)
 EXPECTED_FEATURES = [
     "rps",
     "rps_lag_1",
     "rps_lag_2",
     "rps_lag_3",
-    "rps_mean_3",
-    "rps_mean_6",
+    "rps_rolling_3",
+    "rps_rolling_6",
     "cpu",
     "memory",
     "pod_count",
-    "rps_diff_1",
-    "rps_diff_2",
 ]
 
 # Keep these queries identical to the metric collector used for training.
@@ -117,40 +121,42 @@ logger = logging.getLogger("predictive-controller")
 
 def load_artifacts():
     if not os.path.isfile(MODEL_PATH):
-        raise FileNotFoundError(
-            f"Không tìm thấy model: {MODEL_PATH}. "
-            "Hãy đặt file model cùng thư mục với controller "
-            "hoặc cấu hình biến môi trường MODEL_PATH."
-        )
+        raise FileNotFoundError(f"Không tìm thấy model: {MODEL_PATH}")
 
     if not os.path.isfile(FEATURE_CONFIG_PATH):
         raise FileNotFoundError(
-            f"Không tìm thấy feature config: {FEATURE_CONFIG_PATH}."
+            f"Không tìm thấy feature config: {FEATURE_CONFIG_PATH}"
         )
 
-    # File feature_config_v2.pkl được tạo bằng pickle trong training script.
     with open(MODEL_PATH, "rb") as f:
         model = pickle.load(f)
 
-    with open(FEATURE_CONFIG_PATH, "rb") as f:
-        features = pickle.load(f)
+    import json
 
-    if not isinstance(features, (list, tuple)):
-        raise TypeError(
-            "feature_config_v2.pkl phải chứa list/tuple tên features."
+    with open(FEATURE_CONFIG_PATH, "r", encoding="utf-8") as f:
+        config_data = json.load(f)
+
+    # Hỗ trợ cả JSON dạng list và dạng object có key features
+    if isinstance(config_data, list):
+        features = config_data
+    else:
+        features = config_data.get("features")
+
+    if not isinstance(features, list):
+        raise ValueError(
+            "feature_config.json phải chứa danh sách features."
         )
-
-    features = list(features)
 
     if features != EXPECTED_FEATURES:
         raise ValueError(
-            "Feature order/config không khớp model V2.\n"
+            "Feature config không khớp model.\n"
             f"Expected: {EXPECTED_FEATURES}\n"
-            f"Loaded:   {features}"
+            f"Loaded: {features}"
         )
 
     logger.info("Loaded model: %s", MODEL_PATH)
     logger.info("Loaded %d model features.", len(features))
+
     return model, features
 
 
@@ -227,9 +233,10 @@ def collect_live_metrics():
 
 def build_feature_row(metrics, rps_history, feature_names):
     """
-    rps_history: deque chứa các mẫu RPS trước mẫu hiện tại,
-                 theo thứ tự cũ -> mới, tối đa 5 mẫu.
+    rps_history chứa tối đa 5 mẫu RPS trước mẫu hiện tại.
+    Thứ tự: cũ -> mới.
     """
+
     previous = list(rps_history)
 
     if len(previous) < 5:
@@ -239,34 +246,29 @@ def build_feature_row(metrics, rps_history, feature_names):
 
     current_rps = float(metrics["rps"])
 
-    # previous[-1] là lag 1; previous[-2] là lag 2...
     lag_1 = float(previous[-1])
     lag_2 = float(previous[-2])
     lag_3 = float(previous[-3])
 
-    last_2 = [lag_2, lag_1, current_rps]
-    last_5_previous_plus_current = previous[-5:] + [current_rps]
+    last_3 = previous[-2:] + [current_rps]
+    last_6 = previous[-5:] + [current_rps]
 
     values = {
         "rps": current_rps,
         "rps_lag_1": lag_1,
         "rps_lag_2": lag_2,
         "rps_lag_3": lag_3,
-        "rps_mean_3": float(np.mean(last_2)),
-        "rps_mean_6": float(np.mean(last_5_previous_plus_current)),
+        "rps_rolling_3": float(np.mean(last_3)),
+        "rps_rolling_6": float(np.mean(last_6)),
         "cpu": float(metrics["cpu"]),
         "memory": float(metrics["memory"]),
         "pod_count": int(metrics["pod_count"]),
-        "rps_diff_1": current_rps - lag_1,
-        "rps_diff_2": current_rps - lag_2,
     }
 
-    # Construct by the exact feature order loaded from feature_config_v2.pkl.
     return pd.DataFrame(
         [[values[name] for name in feature_names]],
         columns=feature_names,
     )
-
 
 # ============================================================
 # REPLICA CALCULATION
@@ -276,10 +278,19 @@ def calculate_scaling_decision(predicted_rps):
     predicted_rps = float(predicted_rps)
 
     if not math.isfinite(predicted_rps) or predicted_rps < 0:
-        raise ValueError(f"Predicted RPS không hợp lệ: {predicted_rps}")
+        raise ValueError(
+            f"Predicted RPS không hợp lệ: {predicted_rps}"
+        )
 
+    # Bù sai số dự đoán bằng safety factor
     safe_rps = predicted_rps * SAFETY_FACTOR
-    required_replicas = math.ceil(safe_rps / POD_CAPACITY)
+
+    # Tính số replica cần thiết
+    required_replicas = math.ceil(
+        safe_rps / POD_CAPACITY
+    )
+
+    # Giới hạn min/max replicas
     target_replicas = max(
         MIN_REPLICAS,
         min(MAX_REPLICAS, required_replicas),
@@ -290,6 +301,8 @@ def calculate_scaling_decision(predicted_rps):
         "safe_rps": safe_rps,
         "required_replicas": required_replicas,
         "target_replicas": target_replicas,
+        "capacity_at_target": target_replicas * POD_CAPACITY,
+        "capacity_limited": required_replicas > MAX_REPLICAS,
     }
 
 # ============================================================
@@ -471,21 +484,26 @@ def run_controller():
                     consecutive_scale_down = 0
 
                 logger.info(
-                    "RPS=%.2f | Predicted=%.2f | "
-                    "CPU=%.4f cores | Memory=%.0f bytes | "
-                    "Current=%d | Ready=%d | "
-                    "Safe RPS=%.2f | Required=%d | Target=%d | %s",
+                    "RPS=%.2f | Predicted=%.2f | Safe RPS=%.2f | "
+                    "Required=%d | Target=%d | Capacity=%d | "
+                    "Current=%d | Ready=%d | %s",
                     current_rps,
                     decision["predicted_rps"],
-                    metrics["cpu"],
-                    metrics["memory"],
-                    current_replicas,
-                    ready_replicas,
                     decision["safe_rps"],
                     decision["required_replicas"],
-                    target_replicas,
+                    decision["target_replicas"],
+                    decision["capacity_at_target"],
+                    current_replicas,
+                    ready_replicas,
                     action,
                 )
+
+                if decision["capacity_limited"]:
+                    logger.warning(
+                        "MAX REPLICAS REACHED: Safe RPS=%.2f exceeds max capacity=%d RPS",
+                        decision["safe_rps"],
+                        MAX_REPLICAS * POD_CAPACITY,
+                    )
 
                 rps_history.append(current_rps)
 

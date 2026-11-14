@@ -1,5 +1,5 @@
 requests
 numpy
 pandas
-scikit-learn
+scikit-learn==1.9.1
 kubernetes>=29.0.0,<34.0.0

@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+processed_dataset/
+model_comparison.csv
+test_predictions.csv
+.env
+.venv/
+venv/
