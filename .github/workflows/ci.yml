@@ -10,7 +10,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/predictive-scaling-controller
   GITOPS_REPO: phuleshi/exam-platform-gitops
-  GITOPS_FILE: predictive-controller/deployment.yaml
+  GITOPS_FILE: predictive-controller.yaml
 
 jobs:
   build-and-update-gitops:
