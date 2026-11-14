@@ -508,11 +508,11 @@ def run_controller():
                 # ==========================================
 
                 elif target_replicas < current_replicas:
-                    consecutive_scale_down += 1
-
-                    elapsed_since_scale = (
-                        time.monotonic() - last_scale_time
+                    logger.info(
+                        f"SCALE DOWN DISABLED: "
+                        f"Current={current_replicas}, Target={target_replicas}"
                     )
+                    target_replicas = current_replicas    
 
                     if (
                         consecutive_scale_down >= SCALE_DOWN_CONFIRMATIONS
