@@ -509,24 +509,20 @@ def run_controller():
 
                 elif target_replicas < current_replicas:
                     logger.info(
-                        f"SCALE DOWN DISABLED: "
-                        f"Current={current_replicas}, Target={target_replicas}"
+                        "SCALE DOWN DISABLED: Current=%d, Target=%d",
+                        current_replicas,
+                        target_replicas,
                     )
-                    target_replicas = current_replicas    
 
-                    if (
-                        consecutive_scale_down >= SCALE_DOWN_CONFIRMATIONS
-                        and elapsed_since_scale >= SCALE_DOWN_COOLDOWN
-                    ):
-                        scale_deployment(target_replicas)
+                    # Không cho phép giảm số lượng Pod
+                    consecutive_scale_down = 0
+                    target_replicas = current_replicas
 
-                        last_scale_time = time.monotonic()
-                        consecutive_scale_down = 0
+                    # Cập nhật lại decision để log đúng số replica thực tế
+                    decision["target_replicas"] = target_replicas
+                    decision["capacity_at_target"] = target_replicas * POD_CAPACITY
 
-                        action = (
-                            f"SCALE DOWN: {current_replicas} "
-                            f"-> {target_replicas}"
-                        )
+                    action = "SCALE DOWN DISABLED - KEEP CURRENT REPLICAS"
                     else:
                         action = (
                             f"WAIT SCALE DOWN "
